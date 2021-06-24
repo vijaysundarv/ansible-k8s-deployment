@@ -1,0 +1,206 @@
+---
+- hosts: localhost
+  gather_facts: false
+
+  vars:
+    # based on the environment, the interpreter shall vary. if you've both python2 & 3, then explicitly pass python3 bin path as an extra-vars.
+    ansible_python_interpreter: '{{ ansible_playbook_python }}'
+    # the below directory will be cleaned and recreated everytime with files having minikube service endpoints.
+    minikube_svc_out_dir: '~/minik8s'
+    image_name: simple-rubyserver
+
+  pre_tasks:
+    # the below directory will be cleaned and recreated everytime with files having minikube service endpoints.
+    - name: Clear old config directories "{{ minikube_svc_out_dir }}" and recreate 
+      file:
+        state: "{{ item }}"
+        path: "~/minik8s"
+      with_items:
+        - absent
+        - directory
+
+    # checks if a minikube cluster is running or not. If not, it will start a minikube cluster in the next task.
+    - name: Check Minikube's status.
+      command: minikube status
+      register: minikube_status
+      changed_when: false
+      ignore_errors: true
+    
+    # creates a new single minikube cluster
+    - name: Start Minikube if it's not running.
+      command: minikube start --profile=minikube
+      when: "not minikube_status.stdout or 'Running' not in minikube_status.stdout"
+
+  tasks:
+    
+    # minikube's docker environment is different. since we're not handling any registry related config.
+    # so the docker image needs to be pushed manually.
+    - name: Delete old & rebuild docker image
+      shell: | #Switch to minikube docker environment
+        eval $(minikube docker-env) 
+        docker image rm --force {{ image_name }}
+        docker build -t {{ image_name }} .
+      register: image_delete
+
+    # minikube ip is required to be added to application service so we can communicate from host to minikube vm.
+    - name: Get minikube ip for service access.
+      shell: minikube ip
+      register: minikube_ip
+    
+    - name: Store minikube ip
+      set_fact:
+        external_ip: "{{ minikube_ip.stdout }}"
+
+    # Create Kubernetes deployment resource to run Run WebServer.
+    - name: Create a Deployment for Ruby WebServer.
+      k8s:
+        state: present
+        definition:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: "{{ image_name }}"
+            namespace: default
+          spec:
+            selector:
+              matchLabels:
+                app: "{{ image_name }}"
+            replicas: 2
+            template:
+              metadata:
+                labels:
+                  app: "{{ image_name }}"
+              spec:
+                containers:
+                - image: "{{ image_name }}"
+                  name: rubywebserver
+                  imagePullPolicy: Never
+                  ports:
+                  - name: ruby-port
+                    containerPort: 80
+                  securityContext:
+                    runAsUser: 5000
+                    runAsGroup: 5000
+                    runAsNonRoot: true
+                    capabilities:
+                      drop:
+                        - all
+                      add:
+                        - NET_BIND_SERVICE
+                    allowPrivilegeEscalation: false
+                  livenessProbe:
+                    httpGet:
+                      path: /
+                      port: ruby-port
+                    initialDelaySeconds: 2
+                    periodSeconds: 2
+                    timeoutSeconds: 5
+                    failureThreshold: 2
+                  readinessProbe:
+                    httpGet:
+                      path: /healthcheck
+                      httpHeaders:
+                      - name: Custom-Header
+                        value: OK
+                      port: ruby-port
+                    initialDelaySeconds: 2
+                    periodSeconds: 2
+                    timeoutSeconds: 5
+                    failureThreshold: 2
+
+    # Create Kubernetes service resource to run Run WebServer.
+    - name: Create a Service for Ruby WebServer.
+      k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: "{{ image_name }}"
+            namespace: default
+            labels:
+              app: "{{ image_name }}"
+          spec:
+            ports:
+            - port: 80
+              protocol: TCP
+              targetPort: 80
+              nodePort: 30010
+            selector:
+              app: "{{ image_name }}"
+            type: LoadBalancer
+            externalIPs:
+            - "{{ external_ip }}"
+
+  post_tasks:
+    # Services of type LoadBalancer should be exposed via the minikube tunnel command.
+    # minikube tunnel runs as a process, creating a network route on the host to the service 
+    # CIDR of the cluster using the cluster’s IP address as a gateway. The tunnel command exposes the external IP directly to any program running on the host operating system.
+    - name: Expose Rub WebApp on the host via Minikube tunnel.
+      shell: minikube service {{ image_name }} --url=true > {{ minikube_svc_out_dir }}/svcout 2>&1 &
+
+
+    # wait for particular string to be found in the file. here we wait until the tunnel prints the endpoint url to the file.
+    - name: Wait until the string "http" is in the file "{{ minikube_svc_out_dir }}/svcout"
+      wait_for:
+        path: "{{ minikube_svc_out_dir }}/svcout"
+        search_regex: http
+    
+    # Register the file contents for taking the minikube service endpoint
+    - name: Register the service output file
+      shell: cat {{ minikube_svc_out_dir }}/svcout
+      register: svc_output_full
+      
+    # Apply regex to filter the endpoint URL
+    - name: Extract minikube service exposed URL
+      set_fact:
+        service_url: "{{ svc_output_full.stdout_lines | replace('\n', '') | regex_search(qry) }}"
+      vars:
+        qry: "(http|ftp|https)://([\\w_-]+(?:(?:\\.[\\w_-]+)+))([\\w.,@?^=%&:/~+#-]*[\\w@?^=%&/~+#-])?"
+
+    # Printing service url for debugging purpose.
+    - name: Printing service_url
+      debug:
+        msg: "rubyWebApp URL: {{ service_url }}"
+ 
+    # Testing application/service url endpoints 
+    - name: Verify "{{ service_url }}/healthcheck" endpoint.
+      uri:
+        url: "{{ service_url }}/healthcheck"
+        method: GET
+        return_content: yes
+        status_code: 200
+        body_format: json
+      register: rubyWebApp_healthcheck_response
+      failed_when: "'OK' not in rubyWebApp_healthcheck_response.content"
+
+    # Checking response
+    - name: Return "{{ service_url }}/healthcheck" response
+      debug:
+        msg: "Recieved Response: {{ rubyWebApp_healthcheck_response.content | replace('\n', '') }}"      
+
+    # Testing application/service url endpoints 
+    - name: Verify "{{ service_url }}/" endpoint.
+      uri:
+        url: "{{ service_url }}/"
+        method: GET
+        return_content: yes
+        status_code: 200
+        body_format: json
+      register: rubyWebApp_other_response
+      failed_when: "'hello' not in rubyWebApp_other_response.content"
+
+    # Checking response
+    - name: Return "{{ service_url }}/" response
+      debug:
+        msg: "Recieved Response: {{ rubyWebApp_other_response.content | replace('\n', '') }}"
+    
+    # Info on commands that can be used to test the endpoints.
+    - name: Information
+      shell: echo "Run> curl {{ service_url }}/ OR curl {{ service_url }}/healthcheck"
+      register: information
+
+    - name: Print Test Usage
+      debug:
+        msg: "{{ information.stdout }}"
+
